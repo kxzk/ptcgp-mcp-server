@@ -1,47 +1,54 @@
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 import pandas as pd
 from fuzzywuzzy import process
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("ptcgp")
+from mcp.server.fastmcp import Context, FastMCP
 
 
-def _load_data():
-    """Load and preprocess card data with error handling"""
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+
+    df = await asyncio.to_thread(load_data)
+    yield
+    df = None
+
+
+def load_data() -> pd.DataFrame:
     try:
         df = pd.read_csv("cards_2025-03-26.csv")
-        # Convert stringified JSON columns to Python objects
-        df["attack"] = df["attack"].apply(
-            lambda x: json.loads(x) if pd.notna(x) else []
-        )
-        df["ability"] = df["ability"].apply(
-            lambda x: json.loads(x) if pd.notna(x) else []
-        )
+        json_columns = ["attack", "ability"]
+
+        # optimized json parsing using pd.json_normalize
+        for col in json_columns:
+            df[col] = df[col].apply(lambda x: json.loads(x) if pd.notna(x) else [])
+
         return df
-    except FileNotFoundError:
-        return None
+    except FileNotFoundError as e:
+        raise RuntimeError("Card database file not found") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError("Invalid JSON format in data columns") from e
+
+
+mcp = FastMCP("ptcgp", lifespan=lifespan)
 
 
 @mcp.tool()
-async def get_card_data(card_id: str) -> Any:
+async def get_card_data(ctx: Context, card_id: str) -> Any:
     """Get card data by exact ID match"""
-    df = _load_data()
-    if df is None:
-        return {"error": "Card database missing"}, 500
+    df = ctx.request_context.lifespan_context["df"]
 
     card = df[df["id"] == card_id].to_dict(orient="records")
     return card[0] if card else {"error": "Card not found"}, 404
 
 
 @mcp.tool()
-async def fuzzy_search_pokemon(name: str) -> Any:
+async def fuzzy_search_pokemon(ctx: Context, name: str) -> Any:
     """Fuzzy search Pokémon by name"""
-    df = _load_data()
-    if df is None:
-        return {"error": "Card database missing"}, 500
+    df = ctx.request_context.lifespan_context["df"]
 
     names = df["name"].unique().tolist()
     best_match = process.extractOne(name, names)
@@ -53,19 +60,9 @@ async def fuzzy_search_pokemon(name: str) -> Any:
 
 
 @mcp.tool()
-async def get_all_card_ids() -> Any:
-    """Retrieve all card IDs"""
-    df = _load_data()
-    if df is None:
-        return {"error": "Card database missing"}, 500
-
-    return df["id"].unique().tolist()
-
-
-@mcp.tool()
-async def filter_by_color(color: str) -> Any:
+async def filter_by_color(ctx: Context, color: str) -> Any:
     """Filter cards by color"""
-    df = _load_data()
+    df = ctx.request_context.lifespan_context["df"]
     if df is None:
         return {"error": "Card database missing"}, 500
 
@@ -78,9 +75,9 @@ async def filter_by_color(color: str) -> Any:
 
 
 @mcp.tool()
-async def fuzzy_search_ability(ability_query: str) -> Any:
+async def fuzzy_search_ability(ctx: Context, ability_query: str) -> Any:
     """Fuzzy search cards by ability text"""
-    df = _load_data()
+    df = ctx.request_context.lifespan_context["df"]
     if df is None:
         return {"error": "Card database missing"}, 500
 
